@@ -617,12 +617,56 @@
       font-weight:700;
     }
   }
+
+  /* ---------- SINCRONIZAÇÃO ---------- */
+  .sync-pill{
+    margin-top:8px;
+    display:inline-flex; align-items:center; gap:7px;
+    background:none;
+    border:1px solid var(--line-strong);
+    color:var(--text-muted);
+    font-family:'IBM Plex Sans', sans-serif;
+    font-size:0.72rem;
+    padding:4px 10px;
+    border-radius:2px;
+    cursor:pointer;
+  }
+  .sync-pill::before{
+    content:''; width:7px; height:7px; border-radius:50%;
+    background:var(--text-muted); flex-shrink:0;
+  }
+  .sync-pill[data-estado="ok"]::before{ background:var(--ok); }
+  .sync-pill[data-estado="salvando"]::before{ background:var(--amber); }
+  .sync-pill[data-estado="offline"]::before{ background:var(--steel); }
+  .sync-pill[data-estado="erro"]::before{ background:var(--warn); }
+  .sync-pill[data-estado="desconectado"]{ color:var(--amber); border-color:var(--amber); }
+  .sync-pill[data-estado="desconectado"]::before{ background:var(--amber); }
+  .sync-pill:focus-visible{ outline:2px solid var(--text); outline-offset:2px; }
+  .sync-banner{
+    position:fixed; left:12px; right:12px;
+    bottom:calc(16px + env(safe-area-inset-bottom, 0px));
+    max-width:616px; margin:0 auto;
+    display:none; align-items:center; justify-content:space-between; gap:10px;
+    background:var(--surface-raised);
+    border:1px solid var(--amber);
+    color:var(--text);
+    font-size:0.85rem;
+    padding:10px 12px;
+    z-index:50;
+  }
+  .sync-banner.show{ display:flex; }
+  .sync-banner button{
+    background:var(--amber); color:#14171A; border:none;
+    font-family:'IBM Plex Sans', sans-serif; font-weight:600; font-size:0.82rem;
+    padding:7px 12px; cursor:pointer; flex-shrink:0;
+  }
 </style>
 </head>
 <body>
 
 <header class="top">
   <h1>🍻 Confraternização PPV</h1>
+  <button type="button" class="sync-pill" id="sync-pill" data-estado="desconectado">Carregando…</button>
 </header>
 
 <nav class="tabs">
@@ -916,6 +960,35 @@
   </div>
 </div>
 
+<script>
+// ---------- SINCRONIZAÇÃO: captura as gravações locais (roda antes do app) ----------
+window.__SYNC = {
+  app: 'confra-ppv',
+  keys: [
+    'confraternizacao_funcionarios',
+    'confraternizacao_pagamentos',
+    'confraternizacao_despesas',
+    'confraternizacao_buffet',
+    'confraternizacao_bebidas',
+    'confraternizacao_pix'
+  ],
+  pendentes: {},
+  aplicandoRemoto: false,
+  onLocalChange: null
+};
+(function(){
+  const S = window.__SYNC;
+  const original = Storage.prototype.setItem;
+  S.setItemOriginal = original;
+  Storage.prototype.setItem = function(k, v){
+    original.call(this, k, v);
+    if(this === window.localStorage && !S.aplicandoRemoto && S.keys.includes(k)){
+      S.pendentes[k] = String(v);
+      if(S.onLocalChange) S.onLocalChange();
+    }
+  };
+})();
+</script>
 <script>
 // ---------- PWA MANIFEST + ICON (embutidos, sem arquivos externos) ----------
 const svgIcon = `
@@ -1967,5 +2040,211 @@ mesRelatorio = { ano: mesAtual.ano, mes: mesAtual.mes };
 renderTituloMesRelatorio();
 tornarCardsMinimizaveis();
 </script>
+<div class="sync-banner" id="sync-banner" role="status">
+  <span>Dados atualizados em outro aparelho.</span>
+  <button type="button" id="sync-banner-btn">Atualizar</button>
+</div>
+
+<script type="module">
+// ---------- SINCRONIZAÇÃO COM FIREBASE ----------
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getAuth, GoogleAuthProvider, signInWithPopup, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import { initializeFirestore, persistentLocalCache, persistentMultipleTabManager, doc, setDoc, onSnapshot, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyAt0CxL9DxHCtcqOvqBLew6kRUPPFNMMj4",
+  authDomain: "central-apps-fad36.firebaseapp.com",
+  projectId: "central-apps-fad36",
+  storageBucket: "central-apps-fad36.firebasestorage.app",
+  messagingSenderId: "20651310911",
+  appId: "1:20651310911:web:4bf86f56e0e0a60ff75d8a"
+};
+
+const S = window.__SYNC;
+const pill = document.getElementById('sync-pill');
+const banner = document.getElementById('sync-banner');
+const PEND_KEY = '__sync_pendentes_' + S.app;
+
+let app, auth, db;
+try{
+  app = initializeApp(firebaseConfig);
+  auth = getAuth(app);
+  db = initializeFirestore(app, { localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }) });
+}catch(e){
+  console.error(e);
+  status('Sincronização indisponível', 'erro');
+}
+
+let usuario = null;
+let ref = null;
+let pararEscuta = null;
+let timer = null;
+let primeiraLeitura = true;
+let usuarioInteragiu = false;
+let recarregarPendente = false;
+
+['pointerdown','keydown'].forEach(ev => window.addEventListener(ev, () => { usuarioInteragiu = true; }, { passive:true }));
+
+function status(texto, estado){
+  pill.textContent = texto;
+  pill.dataset.estado = estado;
+}
+
+// Guarda quais chaves ainda não subiram (sobrevive a fechar o app)
+function gravarListaPendentes(){
+  S.setItemOriginal.call(localStorage, PEND_KEY, JSON.stringify(Object.keys(S.pendentes)));
+}
+try{
+  JSON.parse(localStorage.getItem(PEND_KEY) || '[]').forEach(k => {
+    const v = localStorage.getItem(k);
+    if(v !== null && S.keys.includes(k)) S.pendentes[k] = v;
+  });
+}catch(e){}
+
+S.onLocalChange = () => {
+  gravarListaPendentes();
+  agendarEnvio();
+};
+
+function agendarEnvio(){
+  if(!usuario){
+    status('Toque para entrar e sincronizar', 'desconectado');
+    return;
+  }
+  status('Salvando…', 'salvando');
+  clearTimeout(timer);
+  timer = setTimeout(enviar, 700);
+}
+
+function enviar(){
+  if(!usuario || !ref) return;
+  const lote = { ...S.pendentes };
+  const chaves = Object.keys(lote);
+  if(!chaves.length){ atualizarStatusOk(); return; }
+  const dados = {};
+  chaves.forEach(k => { dados[k] = lote[k]; });
+  const promessa = setDoc(ref, { dados, atualizadoEm: serverTimestamp() }, { merge: true });
+  // O Firestore guarda a gravação na fila local; pode limpar as pendências
+  chaves.forEach(k => { if(S.pendentes[k] === lote[k]) delete S.pendentes[k]; });
+  gravarListaPendentes();
+  if(!navigator.onLine) status('Offline, envia ao reconectar', 'offline');
+  promessa.then(atualizarStatusOk).catch(erro);
+}
+
+function atualizarStatusOk(){
+  if(!usuario) return;
+  if(Object.keys(S.pendentes).length) return;
+  if(!navigator.onLine) status('Offline, envia ao reconectar', 'offline');
+  else status('Sincronizado', 'ok');
+}
+
+function erro(e){
+  console.error(e);
+  if(e && e.code === 'permission-denied') status('Sem permissão no banco', 'erro');
+  else status('Erro ao sincronizar', 'erro');
+}
+
+function aplicarRemoto(dados, chaves){
+  // Na primeira sincronização deste aparelho, guarda uma cópia dos dados locais
+  const flag = '__sync_iniciado_' + S.app + '_' + usuario.uid;
+  if(!localStorage.getItem(flag)){
+    const copia = {};
+    chaves.forEach(k => { const v = localStorage.getItem(k); if(v !== null) copia[k] = v; });
+    if(Object.keys(copia).length){
+      S.setItemOriginal.call(localStorage, '__sync_backup_' + S.app, JSON.stringify({ em: new Date().toISOString(), dados: copia }));
+    }
+  }
+  S.aplicandoRemoto = true;
+  chaves.forEach(k => localStorage.setItem(k, dados[k]));
+  S.aplicandoRemoto = false;
+
+  if(primeiraLeitura || document.visibilityState === 'hidden' || !usuarioInteragiu){
+    location.reload();
+  }else{
+    recarregarPendente = true;
+    banner.classList.add('show');
+  }
+}
+
+function iniciarEscuta(){
+  ref = doc(db, 'users', usuario.uid, 'apps', S.app);
+  primeiraLeitura = true;
+  status('Sincronizando…', 'salvando');
+  pararEscuta = onSnapshot(ref, snap => {
+    if(snap.metadata.hasPendingWrites) return;
+    if(snap.metadata.fromCache && primeiraLeitura && !snap.exists()) return; // espera o servidor
+
+    const dados = snap.exists() ? (snap.data().dados || {}) : {};
+    const mudou = [];
+    S.keys.forEach(k => {
+      if(k in S.pendentes) return;
+      const local = localStorage.getItem(k);
+      if(dados[k] === undefined){
+        if(local !== null) S.pendentes[k] = local; // existe só aqui: sobe
+      }else if(dados[k] !== local){
+        mudou.push(k);
+      }
+    });
+
+    const flag = '__sync_iniciado_' + S.app + '_' + usuario.uid;
+    if(mudou.length){
+      aplicarRemoto(dados, mudou);
+    }
+    S.setItemOriginal.call(localStorage, flag, '1');
+
+    if(Object.keys(S.pendentes).length){
+      gravarListaPendentes();
+      agendarEnvio();
+    }else{
+      atualizarStatusOk();
+    }
+    primeiraLeitura = false;
+  }, erro);
+}
+
+if(auth){
+  onAuthStateChanged(auth, user => {
+    if(pararEscuta){ pararEscuta(); pararEscuta = null; }
+    usuario = user;
+    if(user){
+      iniciarEscuta();
+    }else{
+      ref = null;
+      status('Toque para entrar e sincronizar', 'desconectado');
+    }
+  });
+}
+
+pill.addEventListener('click', async () => {
+  if(!auth) return;
+  if(!usuario){
+    try{
+      status('Entrando…', 'salvando');
+      await signInWithPopup(auth, new GoogleAuthProvider());
+    }catch(e){
+      console.error(e);
+      if(e && (e.code === 'auth/popup-closed-by-user' || e.code === 'auth/cancelled-popup-request')){
+        status('Toque para entrar e sincronizar', 'desconectado');
+      }else if(e && e.code === 'auth/unauthorized-domain'){
+        status('Domínio não autorizado no Firebase', 'erro');
+      }else{
+        status('Falha ao entrar, toque para tentar', 'erro');
+      }
+    }
+    return;
+  }
+  if(confirm('Sincronizando com ' + (usuario.email || 'sua conta Google') + '.\n\nDeseja sair? Os dados continuam salvos neste aparelho.')){
+    await signOut(auth);
+  }
+});
+
+document.getElementById('sync-banner-btn').addEventListener('click', () => location.reload());
+document.addEventListener('visibilitychange', () => {
+  if(document.visibilityState === 'visible' && recarregarPendente) location.reload();
+});
+window.addEventListener('online', () => { if(usuario){ if(Object.keys(S.pendentes).length) agendarEnvio(); else atualizarStatusOk(); } });
+window.addEventListener('offline', () => { if(usuario) status('Offline, envia ao reconectar', 'offline'); });
+</script>
+
 </body>
 </html>
